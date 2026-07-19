@@ -7,6 +7,7 @@ import Modal from './modal'
 import Lang from '../core/lang'
 import EpisodeParser from '../utils/episodes_parser'
 import Arrays from '../utils/arrays'
+import DeviceCaps from '../core/device_caps'
 
 let network  = new Request()
 let gst_work = false
@@ -139,7 +140,7 @@ function gstWork(){
 }
 
 function stream(path, hash, id){
-    if(gstWork()) return url() + '/gst/' + encodeURIComponent(hash) + '/master.m3u8?index=' + id + '&audio=0'
+    if(gstWork()) return url() + '/gst/' + encodeURIComponent(hash) + '/master.m3u8?index=' + id + '&audio=0' + DeviceCaps.gstQuery()
 
     return url() + '/stream/'+ encodeURIComponent(path.split('\\').pop().split('/').pop()) +'?link=' + hash + '&index=' + id + '&' + (Storage.field('torrserver_preload') ? 'preload' : 'play')
 }
