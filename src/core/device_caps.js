@@ -1,138 +1,125 @@
 import Platform from './platform'
 
 /**
- * Device capabilities probe for TorrServer gstreamer transcoding.
+ * Device capability probe for TorrServer gstreamer transcoding.
  *
- * Detects what the current environment can play and HOW WELL it plays
- * it, and exposes the result as a query string appended to the
- * /gst/{hash}/master.m3u8 URL:
+ * Probes whether the current environment can decode a SPECIFIC file's
+ * codecs at its real resolution / bitrate / framerate, and exposes the
+ * result as a query string appended to the /gst/{hash}/master.m3u8 URL:
  *
- *     &v=h264:hw,h265:sw,av1:no&a=aac,ac3
+ *     &v=h264:hw,h265:no,av1:sw&a=aac,ac3
  *
- * Every video codec from the table is reported with a quality tier:
- *   hw — hardware decode (smooth + powerEfficient on a UHD probe):
- *        passthrough always, original quality kept.
- *   sw — playable smoothly at FHD only (software or weak hardware):
- *        passthrough up to 1080p, transcode 4K.
- *   no — unsupported or stutters: transcode always.
- * All table codecs are always sent (explicit `no` beats omission —
- * the server can tell "unsupported" from "not probed").
+ * Every video codec present in the file is reported with a tier:
+ *   hw — smooth + powerEfficient at this file's resolution: hardware
+ *        decode, passthrough keeps original quality.
+ *   sw — smooth but not powerEfficient: software or weak-hardware
+ *        decode that keeps up; passthrough still ok.
+ *   no — not supported or stutters: transcode.
+ * Audio codecs present in the file are listed when the client can
+ * decode them (binary — software audio decode is cheap).
  *
- * Audio codecs are binary (listed = playable): software audio decode
- * is cheap, so no tiering is needed there.
+ * The probe feeds the file's real params (from its ffprobe) to the
+ * Media Capabilities API, so the tier is accurate for THAT file: a
+ * device that decodes HEVC smoothly at 1080p but chokes on 4K gets
+ * different tiers for the two files. Movies are typically 24fps; the
+ * file's own avg_frame_rate is used when present.
  *
- * The final quality-vs-smoothness decision lives on the SERVER: it
- * knows the actual file parameters (resolution, bitrate) from its own
- * probe and intersects them with these tiers.
+ * Two-stage:
+ *   gstQuerySync(ffprobe) — synchronous, returns the cached result or
+ *     a canPlayType baseline (hw/sw unknown → "plays at all" → sw).
+ *     Safe for the first read before the async probe warms.
+ *   ensureProbed(ffprobe) — async Promise that runs decodingInfo per
+ *     codec against the file's real params and caches the result.
+ *     Call this at the play click, before building the stream URL.
  *
- * Probing has two stages. A synchronous baseline (canPlayType /
- * isTypeSupported — "plays at all", tier 1) is computed lazily on
- * first use and memoized. Where the Media Capabilities API exists, an
- * async refinement upgrades/downgrades tiers per codec; stream URLs
- * built later pick the refined values up automatically. No Storage
- * persistence — probing at load is fast enough.
+ * Results are memoized by file params (w×h×bitrate×fps) so re-entering
+ * a file or seeking reuses them. No Storage persistence.
  */
 
-const VIDEO_MIMES = {
-    h264: [
-        'video/mp4; codecs="avc1.640028"',  // High 4.0
-        'video/mp4; codecs="avc1.4d0028"',  // Main 4.0
-        'video/mp4; codecs="avc1.42E01E"'   // Baseline 3.0
-    ],
-    h265: [
-        'video/mp4; codecs="hvc1.1.6.L153.B0"', // Main 5.1
-        'video/mp4; codecs="hev1.1.6.L153.B0"',
-        'video/mp4; codecs="hvc1.2.4.L153.B0"'  // Main10 5.1
-    ],
-    av1: [
-        'video/mp4; codecs="av01.0.08M.08"',
-        'video/mp4; codecs="av01.0.08M.10"'
-    ],
-    vp9: [
-        'video/mp4; codecs="vp09.00.10.08"',
-        'video/mp4; codecs="vp09.02.10.10"',    // 10-bit
-        'video/webm; codecs="vp9"'
-    ],
-    vp8: [
-        'video/webm; codecs="vp8"',
-        'video/mp4; codecs="vp08"'
-    ],
-    mpeg4: [
-        'video/mp4; codecs="mp4v.20.8"'         // MPEG-4 Part 2 (divx/xvid)
-    ],
-    mpeg2: [
-        'video/mpeg',
-        'video/mp4; codecs="mp2v"'
-    ],
-    vc1: [
-        'video/mp4; codecs="vc-1"'
-    ]
+// ffprobe video codec_name -> Lampa codec key -> mime variants.
+// Each codec counts as supported when ANY mime variant passes.
+const VIDEO_CODECS = {
+    h264: {
+        ffprobe: ['h264'],
+        mimes: [
+            'video/mp4; codecs="avc1.640028"',  // High 4.0
+            'video/mp4; codecs="avc1.4d0028"',  // Main 4.0
+            'video/mp4; codecs="avc1.42E01E"'   // Baseline 3.0
+        ]
+    },
+    h265: {
+        ffprobe: ['hevc', 'h265'],
+        mimes: [
+            'video/mp4; codecs="hvc1.1.6.L153.B0"', // Main 5.1
+            'video/mp4; codecs="hev1.1.6.L153.B0"',
+            'video/mp4; codecs="hvc1.2.4.L153.B0"'  // Main10 5.1
+        ]
+    },
+    av1: {
+        ffprobe: ['av1'],
+        mimes: [
+            'video/mp4; codecs="av01.0.08M.08"',
+            'video/mp4; codecs="av01.0.08M.10"'
+        ]
+    },
+    vp9: {
+        ffprobe: ['vp9'],
+        mimes: [
+            'video/mp4; codecs="vp09.00.10.08"',
+            'video/mp4; codecs="vp09.02.10.10"',    // 10-bit
+            'video/webm; codecs="vp9"'
+        ]
+    },
+    vp8: {
+        ffprobe: ['vp8'],
+        mimes: [
+            'video/webm; codecs="vp8"',
+            'video/mp4; codecs="vp08"'
+        ]
+    },
+    mpeg4: {
+        ffprobe: ['mpeg4', 'msmpeg4', 'divx', 'xvid'],
+        mimes: ['video/mp4; codecs="mp4v.20.8"']
+    },
+    mpeg2: {
+        ffprobe: ['mpeg2video', 'mpeg2'],
+        mimes: ['video/mpeg', 'video/mp4; codecs="mp2v"']
+    },
+    vc1: {
+        ffprobe: ['vc1', 'wmv3'],
+        mimes: ['video/mp4; codecs="vc-1"']
+    }
 }
 
-const AUDIO_MIMES = {
-    aac: [
-        'audio/mp4; codecs="mp4a.40.2"',        // AAC-LC
-        'audio/mp4; codecs="mp4a.40.5"',        // HE-AAC
-        'audio/mp4; codecs="mp4a.40.29"'        // HE-AACv2
-    ],
-    mp3: [
-        'audio/mpeg',
-        'audio/mp4; codecs="mp4a.40.34"'
-    ],
-    ac3: [
-        'video/mp4; codecs="ac-3"',
-        'audio/mp4; codecs="ac-3"'
-    ],
-    eac3: [
-        'video/mp4; codecs="ec-3"',
-        'audio/mp4; codecs="ec-3"'
-    ],
-    dts: [
-        'audio/mp4; codecs="dtsc"',             // DTS core
-        'audio/mp4; codecs="dtsh"',             // DTS-HD
-        'audio/mp4; codecs="dtse"'              // DTS Express / LBR
-    ],
-    truehd: [
-        'audio/mp4; codecs="mlpa"'              // Dolby TrueHD / MLP
-    ],
-    flac: [
-        'audio/mp4; codecs="fLaC"',
-        'audio/flac'
-    ],
-    opus: [
-        'audio/mp4; codecs="Opus"',
-        'audio/ogg; codecs="opus"',
-        'audio/webm; codecs="opus"'
-    ],
-    vorbis: [
-        'audio/webm; codecs="vorbis"',
-        'audio/ogg; codecs="vorbis"'
-    ]
+// ffprobe audio codec_name -> mime variants.
+const AUDIO_CODECS = {
+    aac:     {ffprobe: ['aac'],           mimes: ['audio/mp4; codecs="mp4a.40.2"', 'audio/mp4; codecs="mp4a.40.5"', 'audio/mp4; codecs="mp4a.40.29"']},
+    mp3:     {ffprobe: ['mp3'],           mimes: ['audio/mpeg', 'audio/mp4; codecs="mp4a.40.34"']},
+    ac3:     {ffprobe: ['ac3'],           mimes: ['video/mp4; codecs="ac-3"', 'audio/mp4; codecs="ac-3"']},
+    eac3:    {ffprobe: ['eac3'],          mimes: ['video/mp4; codecs="ec-3"', 'audio/mp4; codecs="ec-3"']},
+    dts:     {ffprobe: ['dts', 'dts-hd', 'dts_hd'], mimes: ['audio/mp4; codecs="dtsc"', 'audio/mp4; codecs="dtsh"', 'audio/mp4; codecs="dtse"']},
+    truehd:  {ffprobe: ['truehd'],        mimes: ['audio/mp4; codecs="mlpa"']},
+    flac:    {ffprobe: ['flac'],          mimes: ['audio/mp4; codecs="fLaC"', 'audio/flac']},
+    opus:    {ffprobe: ['opus'],          mimes: ['audio/mp4; codecs="Opus"', 'audio/webm; codecs="opus"']},
+    vorbis:  {ffprobe: ['vorbis'],        mimes: ['audio/webm; codecs="vorbis"', 'audio/ogg; codecs="vorbis"']}
 }
 
-// Media Capabilities probe profiles. UHD numbers approximate a typical
-// 4K remux; FHD — a regular 1080p rip.
-const MC_PROBE = {
-    uhd: {width: 3840, height: 2160, bitrate: 25e6, framerate: 30},
-    fhd: {width: 1920, height: 1080, bitrate: 8e6, framerate: 30}
-}
+let cache = {}        // paramsKey -> {v: {codec: tier}, a: [codec]}
+let probing = {}      // paramsKey -> Promise
 
-let probed = null      // {v: {codec: tier}, a: [codec, ...]}
-let native_hls = null
-let refining = false
+function legacyPlatform(){
+    // Old TV platforms stub or break canPlayType — static safe defaults.
+    return Platform.is('orsay') || Platform.is('netcast')
+}
 
 function detectNativeHls(){
-    if(native_hls !== null) return native_hls
-
-    native_hls = false
-
     try{
         let video = document.createElement('video')
-        native_hls = !!(video.canPlayType && video.canPlayType('application/vnd.apple.mpegurl') !== '')
+        return !!(video.canPlayType && video.canPlayType('application/vnd.apple.mpegurl') !== '')
     }
-    catch(e){}
-
-    return native_hls
+    catch(e){
+        return false
+    }
 }
 
 function nativeTester(){
@@ -163,23 +150,96 @@ function mseTester(){
     }
 }
 
-function legacyPlatform(){
-    // Old TV platforms stub or break canPlayType — don't trust probes
-    // there, fall back to static safe defaults.
-    return Platform.is('orsay') || Platform.is('netcast')
-}
-
 function pickTester(){
     // Probe through the same pipeline that will play the stream:
     // native HLS on TVs/Safari, hls.js (MSE) everywhere else.
     return (detectNativeHls() ? nativeTester() : mseTester()) || nativeTester() || mseTester()
 }
 
-function probeBaseline(){
+// --- ffprobe param extraction ---
+
+function parseFramerate(rate){
+    // ffprobe avg_frame_rate is "num/den" (e.g. "24000/1001").
+    if(!rate || typeof rate != 'string') return 24
+
+    let parts = rate.split('/')
+
+    if(parts.length == 2){
+        let num = parseFloat(parts[0])
+        let den = parseFloat(parts[1])
+
+        if(den > 0 && num > 0) return Math.round(num / den)
+    }
+
+    let n = parseFloat(rate)
+
+    return n > 0 ? Math.round(n) : 24
+}
+
+function videoStream(ffprobe){
+    if(!ffprobe || !ffprobe.length) return null
+
+    return ffprobe.find((s)=>s && s.codec_type == 'video') || null
+}
+
+function audioStreams(ffprobe){
+    if(!ffprobe || !ffprobe.length) return []
+
+    return ffprobe.filter((s)=>s && s.codec_type == 'audio')
+}
+
+function extractParams(ffprobe){
+    let video = videoStream(ffprobe)
+
+    if(!video) return null
+
+    let width = parseInt(video.width, 10) || 1920
+    let height = parseInt(video.height, 10) || 1080
+    let framerate = parseFramerate(video.avg_frame_rate || video.r_frame_rate)
+
+    let bitrate = parseInt(video.bit_rate, 10) || 0
+
+    // Fall back to size/duration if bit_rate is absent (common for
+    // mkv). ffprobe duration is seconds; size is bytes.
+    if(!bitrate && video.duration){
+        let bytes = parseInt(video.size, 10) || 0
+
+        if(bytes && video.duration > 0) bitrate = Math.round(bytes * 8 / video.duration)
+    }
+
+    if(!bitrate) bitrate = Math.round(width * height * framerate * 0.1) // rough heuristic
+
+    return {width, height, framerate, bitrate, codec: (video.codec_name || '').toLowerCase()}
+}
+
+function paramsKey(params){
+    return params.width + 'x' + params.height + 'x' + params.bitrate + 'x' + params.framerate
+}
+
+// --- codec lookup ---
+
+function findVideoKey(codecName){
+    for(let key in VIDEO_CODECS){
+        if(VIDEO_CODECS[key].ffprobe.indexOf(codecName) >= 0) return key
+    }
+
+    return null
+}
+
+function findAudioKey(codecName){
+    for(let key in AUDIO_CODECS){
+        if(AUDIO_CODECS[key].ffprobe.indexOf(codecName) >= 0) return key
+    }
+
+    return null
+}
+
+// --- sync baseline ---
+
+function baseline(ffprobe){
     let caps = {v: {}, a: []}
 
     if(legacyPlatform()){
-        // Pre-2015 TVs: hardware H264 up to FHD, nothing else certain.
         caps.v.h264 = 'sw'
         caps.a.push('aac')
         return caps
@@ -187,101 +247,145 @@ function probeBaseline(){
 
     let test = pickTester()
 
-    if(test){
-        let any = (mimes)=>mimes.some(test)
+    if(!test) return caps
 
-        for(let codec in VIDEO_MIMES){
-            // Synchronous APIs can't tell hardware from software —
-            // conservatively assume sw and let the async Media
-            // Capabilities refinement upgrade to hw (or drop to no).
-            if(any(VIDEO_MIMES[codec])) caps.v[codec] = 'sw'
+    let video = videoStream(ffprobe)
+
+    if(video){
+        let key = findVideoKey((video.codec_name || '').toLowerCase())
+
+        if(key){
+            // canPlayType can't tell hw from sw — assume sw conservatively.
+            if(VIDEO_CODECS[key].mimes.some(test)) caps.v[key] = 'sw'
         }
-        for(let codec in AUDIO_MIMES){
-            if(any(AUDIO_MIMES[codec])) caps.a.push(codec)
-        }
+
+        // h264 is the transcode target — always advertise it.
+        if(!caps.v.h264) caps.v.h264 = 'sw'
     }
 
-    // H264 is the transcode target — advertising it is always safe
-    // even if the probe lied.
-    if(!caps.v.h264) caps.v.h264 = 'sw'
+    audioStreams(ffprobe).forEach((s)=>{
+        let key = findAudioKey((s.codec_name || '').toLowerCase())
+
+        if(key && AUDIO_CODECS[key].mimes.some(test) && caps.a.indexOf(key) === -1) caps.a.push(key)
+    })
 
     return caps
 }
 
-function mcTier(contentType){
+// --- async refinement via Media Capabilities ---
+
+function mcTierFor(contentType, params){
     let type = detectNativeHls() ? 'file' : 'media-source'
-
-    // UHD first: a hardware path answers smooth + powerEfficient.
-    // Software may still be smooth at UHD (strong desktop CPU) — that
-    // stays sw since it burns the CPU the torrent download needs.
-    return navigator.mediaCapabilities.decodingInfo({
+    let query = {
         type: type,
-        video: Object.assign({contentType: contentType}, MC_PROBE.uhd)
-    }).then((uhd)=>{
-        if(uhd.supported && uhd.smooth && uhd.powerEfficient) return 'hw'
-
-        return navigator.mediaCapabilities.decodingInfo({
-            type: type,
-            video: Object.assign({contentType: contentType}, MC_PROBE.fhd)
-        }).then((fhd)=>{
-            return fhd.supported && fhd.smooth ? 'sw' : 'no'
-        })
-    })
-}
-
-function refine(){
-    if(refining || !probed) return
-    if(legacyPlatform()) return
-    if(!navigator.mediaCapabilities || !navigator.mediaCapabilities.decodingInfo) return
-
-    refining = true
-
-    // Probe every codec, not just baseline passes: Media Capabilities
-    // is newer and more accurate than canPlayType, it may know about
-    // support the old APIs deny.
-    for(let codec in VIDEO_MIMES){
-        mcTier(VIDEO_MIMES[codec][0]).then((tier)=>{
-            // H264 is the transcode target — never report no, or
-            // the server has nothing safe left to transcode INTO.
-            if(codec == 'h264' && tier == 'no') tier = 'sw'
-
-            probed.v[codec] = tier
-        }).catch(()=>{
-            // decodingInfo rejection — keep the baseline tier.
-        })
+        video: {
+            contentType: contentType,
+            width: params.width,
+            height: params.height,
+            bitrate: params.bitrate,
+            framerate: params.framerate
+        }
     }
+
+    return navigator.mediaCapabilities.decodingInfo(query).then((info)=>{
+        if(!info.supported) return 'no'
+        if(info.smooth && info.powerEfficient) return 'hw'
+        if(info.smooth) return 'sw'
+
+        return 'no'
+    }).catch(()=>null)
 }
 
-function probe(){
-    if(probed) return probed
+function runProbe(ffprobe, params){
+    let caps = baseline(ffprobe)
 
-    probed = probeBaseline()
+    if(legacyPlatform()) return Promise.resolve(caps)
 
-    refine()
+    if(!navigator.mediaCapabilities || !navigator.mediaCapabilities.decodingInfo){
+        return Promise.resolve(caps)
+    }
 
-    return probed
+    let video = videoStream(ffprobe)
+    let tasks = []
+
+    // Probe the file's actual video codec(s) against the real params.
+    if(video){
+        let key = findVideoKey((video.codec_name || '').toLowerCase())
+
+        if(key){
+            tasks.push(mcTierFor(VIDEO_CODECS[key].mimes[0], params).then((tier)=>{
+                if(tier){
+                    if(key == 'h264' && tier == 'no') tier = 'sw'
+
+                    caps.v[key] = tier
+                }
+            }))
+        }
+
+        // Always probe h264 too (transcode target) so the server knows
+        // whether even the fallback will play smoothly.
+        if(key != 'h264'){
+            tasks.push(mcTierFor(VIDEO_CODECS.h264.mimes[0], params).then((tier)=>{
+                if(tier){
+                    if(tier == 'no') tier = 'sw'
+
+                    caps.v.h264 = tier
+                }
+            }))
+        }
+    }
+
+    return Promise.all(tasks).then(()=>caps)
 }
 
-/**
- * Query string fragment for the /gst/ master.m3u8 URL. Always lists
- * every video codec from the table (`no` when unprobed/unsupported);
- * audio lists only what passed. H264 degrades to sw at worst, so a
- * probe-less environment still yields the safe "transcode everything
- * but h264" descriptor.
- */
-function gstQuery(){
-    let caps = probe()
+// --- public API ---
 
-    let v = Object.keys(VIDEO_MIMES).map((codec)=>codec + ':' + (caps.v[codec] || 'no'))
+function ensureProbed(ffprobe){
+    let params = extractParams(ffprobe)
 
-    let out = '&v=' + v.join(',')
+    if(!params) return Promise.resolve()
 
+    let key = paramsKey(params)
+
+    if(cache[key]) return Promise.resolve()
+
+    if(probing[key]) return probing[key]
+
+    probing[key] = runProbe(ffprobe, params).then((caps)=>{
+        cache[key] = caps
+    }).finally(()=>{
+        delete probing[key]
+    })
+
+    return probing[key]
+}
+
+function gstQuerySync(ffprobe){
+    let params = extractParams(ffprobe)
+    let caps = params && cache[paramsKey(params)]
+
+    if(!caps) caps = baseline(ffprobe)
+
+    let v = Object.keys(caps.v).map((codec)=>codec + ':' + caps.v[codec])
+
+    let out = ''
+
+    if(v.length) out += '&v=' + v.join(',')
     if(caps.a.length) out += '&a=' + caps.a.join(',')
 
     return out
 }
 
+/**
+ * Async full probe. Returns the query string after running decodingInfo
+ * against the file's real params. Memoized so repeated reads are free.
+ */
+function gstQuery(ffprobe){
+    return ensureProbed(ffprobe).then(()=>gstQuerySync(ffprobe))
+}
+
 export default {
-    probe,
-    gstQuery
+    ensureProbed,
+    gstQuery,
+    gstQuerySync
 }

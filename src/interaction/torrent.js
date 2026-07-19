@@ -12,6 +12,7 @@ import Api from '../core/api/api'
 import Android from '../core/android'
 import Favorite from '../core/favorite'
 import Platform from '../core/platform'
+import DeviceCaps from '../core/device_caps'
 import Select from './select'
 import Noty from './noty'
 import Lang from '../core/lang'
@@ -425,6 +426,14 @@ function list(items, params){
 
             if(params.movie.id) Favorite.add('history', params.movie, 100)
 
+            // Probe the device's ability to decode THIS file's codecs at
+            // its real resolution/bitrate before building the stream URL,
+            // so the tier passed to TorrServer is accurate for the file
+            // (hw/sw/no). Falls back to the sync canPlayType baseline if
+            // the Media Capabilities probe is unavailable or slow.
+            DeviceCaps.ensureProbed(element.ffprobe).then(()=>{
+                element.url = Torserver.stream(element.path, SERVER.hash, element.id, element.ffprobe)
+
             preload(element, ()=>{
                 Player.play(element)
 
@@ -441,6 +450,7 @@ function list(items, params){
                 }
 
                 Lampa.Listener.send('torrent_file',{type:'onenter',element,item,items,params})
+            })
             })
         }).on('hover:long',()=>{
             stopAutostart()

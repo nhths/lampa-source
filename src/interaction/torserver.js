@@ -139,8 +139,8 @@ function gstWork(){
     return Storage.field('torrserver_gts') && gst_work
 }
 
-function stream(path, hash, id){
-    if(gstWork()) return url() + '/gst/' + encodeURIComponent(hash) + '/master.m3u8?index=' + id + '&audio=0' + DeviceCaps.gstQuery()
+function stream(path, hash, id, ffprobe){
+    if(gstWork()) return url() + '/gst/' + encodeURIComponent(hash) + '/master.m3u8?index=' + id + '&audio=0' + DeviceCaps.gstQuerySync(ffprobe)
 
     return url() + '/stream/'+ encodeURIComponent(path.split('\\').pop().split('/').pop()) +'?link=' + hash + '&index=' + id + '&' + (Storage.field('torrserver_preload') ? 'preload' : 'play')
 }
