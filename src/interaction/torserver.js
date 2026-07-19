@@ -145,6 +145,30 @@ function stream(path, hash, id, ffprobe){
     return url() + '/stream/'+ encodeURIComponent(path.split('\\').pop().split('/').pop()) +'?link=' + hash + '&index=' + id + '&' + (Storage.field('torrserver_preload') ? 'preload' : 'play')
 }
 
+// Per-file ffprobe via TorrServer's /ffp/{hash}/{id}. Resolves to the
+// standard ffprobe object ({streams:[...]}) or null on failure / when
+// gst is off (no point probing without transcoding). Used by the
+// device-capability probe to feed the ACTUAL file's resolution / codec
+// to Media Capabilities instead of a torrent-level proxy.
+function ffprobe(hash, id){
+    return new Promise((resolve)=>{
+        if(!gstWork()){
+            resolve(null)
+            return
+        }
+
+        let http = new Request()
+
+        http.timeout(15000)
+
+        http.silent(url() + '/ffp/' + encodeURIComponent(hash) + '/' + encodeURIComponent(id), (json)=>{
+            resolve(json && json.streams ? json : null)
+        }, ()=>{
+            resolve(null)
+        })
+    })
+}
+
 function drop(hash, success, fail){
     if(gstWork()) return network.silent(url()+'/gst/remove?hash=' + encodeURIComponent(hash), success, fail, data, {dataType: 'text'})
 
@@ -318,6 +342,7 @@ export default {
     clear,
     drop,
     stream,
+    ffprobe,
     remove,
     connected,
     parse,

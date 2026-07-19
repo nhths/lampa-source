@@ -426,13 +426,17 @@ function list(items, params){
 
             if(params.movie.id) Favorite.add('history', params.movie, 100)
 
-            // Probe the device's ability to decode THIS file's codecs at
-            // its real resolution/bitrate before building the stream URL,
-            // so the tier passed to TorrServer is accurate for the file
-            // (hw/sw/no). Falls back to the sync canPlayType baseline if
-            // the Media Capabilities probe is unavailable or slow.
-            DeviceCaps.ensureProbed(element.ffprobe).then(()=>{
-                element.url = Torserver.stream(element.path, SERVER.hash, element.id, element.ffprobe)
+            // Fetch the per-file ffprobe (resolution / codec / bitrate)
+            // and probe the device's ability to decode THIS file before
+            // building the stream URL, so the hw/sw/no tier passed to
+            // TorrServer is accurate for the actual file. Falls back to
+            // a torrent-level ffprobe, then to the sync canPlayType
+            // baseline, if the per-file probe is unavailable.
+            Torserver.ffprobe(SERVER.hash, element.id).then((ffp)=>{
+                if(ffp && ffp.streams) element.ffprobe = ffp.streams
+
+                DeviceCaps.ensureProbed(element.ffprobe).then(()=>{
+                    element.url = Torserver.stream(element.path, SERVER.hash, element.id, element.ffprobe)
 
             preload(element, ()=>{
                 Player.play(element)
@@ -450,6 +454,7 @@ function list(items, params){
                 }
 
                 Lampa.Listener.send('torrent_file',{type:'onenter',element,item,items,params})
+            })
             })
             })
         }).on('hover:long',()=>{
