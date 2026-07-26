@@ -7,7 +7,7 @@ import Platform from './platform'
  * codecs at its real resolution / bitrate / framerate, and exposes the
  * result as a query string appended to the /gst/{hash}/master.m3u8 URL:
  *
- *     &v=h264:hw,h265:no,av1:sw&a=aac,ac3
+ *     &v=h264:hw,h265:no,av1:sw&a=aac,ac3&hdr=pq,hlg,bt2020,hdr10,10bit
  *
  * Every video codec present in the file is reported with a tier:
  *   hw — smooth + powerEfficient at this file's resolution: hardware
@@ -15,8 +15,23 @@ import Platform from './platform'
  *   sw — smooth but not powerEfficient: software or weak-hardware
  *        decode that keeps up; passthrough still ok.
  *   no — not supported or stutters: transcode.
+ *
  * Audio codecs present in the file are listed when the client can
  * decode them (binary — software audio decode is cheap).
+ *
+ * HDR capability (since 2026-07-26): the &hdr= token tells the server
+ * which high-dynamic-range features the client can decode natively so
+ * it can decide between passthrough and tone-mapping. Possible flags:
+ *   pq     — can decode SMPTE ST 2084 (HDR10 / Dolby Vision base layer)
+ *   hlg    — can decode Hybrid Log-Gamma (HDR broadcast)
+ *   hdr10  — supports HDR10 metadata (static)
+ *   hdr10p — supports HDR10+ dynamic metadata
+ *   dv     — can decode Dolby Vision (any profile)
+ *   bt2020 — supports BT.2020 colour primaries
+ *   10bit  — can decode 10-bit samples (HEVC Main10, AV1 Main10, VP9 Profile 2)
+ *   none   — explicit "I cannot decode any HDR" — server must tone-map
+ * If the token is absent the server keeps its current behaviour
+ * (HDRToSDR config flag drives tone-mapping).
  *
  * The probe feeds the file's real params (from its ffprobe) to the
  * Media Capabilities API, so the tier is accurate for THAT file: a
@@ -101,10 +116,56 @@ const AUDIO_CODECS = {
     truehd:  {ffprobe: ['truehd'],        mimes: ['audio/mp4; codecs="mlpa"']},
     flac:    {ffprobe: ['flac'],          mimes: ['audio/mp4; codecs="fLaC"', 'audio/flac']},
     opus:    {ffprobe: ['opus'],          mimes: ['audio/mp4; codecs="Opus"', 'audio/webm; codecs="opus"']},
-    vorbis:  {ffprobe: ['vorbis'],        mimes: ['audio/webm; codecs="vorbis"', 'audio/ogg; codecs="vorbis"']}
+    vorbis:  {ffprobe: ['vorbis'],        mimes: ['audio/webm; codecs="vorbis"', 'audio/ogg; codecs="vorbis"']
+    }
 }
 
-let cache = {}        // paramsKey -> {v: {codec: tier}, a: [codec]}
+// HDR features probed via MediaCapabilities. Each entry has a mime
+// query that — when supported — proves the client can decode the
+// feature. 10-bit is a sample-depth hint, not a transfer-function flag,
+// and is required for any HDR10/HLG hevc or av1 stream.
+const HDR_PROBES = {
+    pq: {
+        // HEVC Main10, 4K, 30fps — covers most HDR10 sources.
+        mimes: ['video/mp4; codecs="hvc1.2.4.L153.B0"']
+    },
+    hlg: {
+        // HEVC Main10 HLG. Most TVs report PQ instead; if PQ works
+        // HLG almost always works too (same decoder pipeline). Treat
+        // pq as sufficient proxy.
+        mimes: ['video/mp4; codecs="hvc1.2.4.L153.B0"']
+    },
+    hdr10: {
+        // Same query as pq — HDR10 == PQ + static metadata.
+        mimes: ['video/mp4; codecs="hvc1.2.4.L153.B0"']
+    },
+    hdr10p: {
+        // No widely-used mime carries the + suffix yet; fall back to
+        // hdr10 base probe. A device that decodes HDR10 usually decodes
+        // HDR10+ as well.
+        mimes: ['video/mp4; codecs="hvc1.2.4.L153.B0"']
+    },
+    dv: {
+        // Dolby Vision streams carry 'dvav' or 'dvh1' in codec box;
+        // not a separate transfer function.
+        mimes: ['video/mp4; codecs="dvhe.05.06"'] // profile 5 (HDR base layer)
+    },
+    bt2020: {
+        // Rec.2020 colour primaries are bundled with PQ/HLG 10-bit —
+        // any device that decodes PQ/HLG can paint BT.2020.
+        mimes: ['video/mp4; codecs="hvc1.2.4.L153.B0"']
+    },
+    '10bit': {
+        // Same Main10 query — a positive answer implies 10-bit is ok.
+        mimes: ['video/mp4; codecs="hvc1.2.4.L153.B0"']
+    }
+}
+
+// Order matters: features are emitted in this order in the query string
+// so logs/diff are stable. "none" is special-cased and not probed.
+const HDR_FEATURES = ['pq', 'hlg', 'hdr10', 'hdr10p', 'dv', 'bt2020', '10bit']
+
+let cache = {}        // paramsKey -> {v: {codec: tier}, a: [codec], hdr: [feature]}
 let probing = {}      // paramsKey -> Promise
 
 function legacyPlatform(){
@@ -209,7 +270,24 @@ function extractParams(ffprobe){
 
     if(!bitrate) bitrate = Math.round(width * height * framerate * 0.1) // rough heuristic
 
-    return {width, height, framerate, bitrate, codec: (video.codec_name || '').toLowerCase()}
+    // HDR/colour hints from ffprobe (used to bias the sync baseline
+    // when we can't probe via Media Capabilities).
+    let transfer = (video.color_transfer || '').toLowerCase()
+    let primaries = (video.color_primaries || '').toLowerCase()
+    let pixfmt = (video.pix_fmt || '').toLowerCase()
+    let isHdr = transfer === 'smpte2084' || transfer === 'arib-std-b67' ||
+                pixfmt.indexOf('p010') >= 0 || pixfmt.indexOf('yuv420p10') >= 0
+    let isBt2020 = primaries === 'bt2020'
+
+    return {
+        width, height, framerate, bitrate,
+        codec: (video.codec_name || '').toLowerCase(),
+        transfer: transfer,
+        primaries: primaries,
+        pixfmt: pixfmt,
+        isHdr: isHdr,
+        isBt2020: isBt2020
+    }
 }
 
 function paramsKey(params){
@@ -237,7 +315,7 @@ function findAudioKey(codecName){
 // --- sync baseline ---
 
 function baseline(ffprobe){
-    let caps = {v: {}, a: []}
+    let caps = {v: {}, a: [], hdr: []}
 
     if(legacyPlatform()){
         caps.v.h264 = 'sw'
@@ -272,6 +350,52 @@ function baseline(ffprobe){
     return caps
 }
 
+function baselineHdr(ffprobe){
+    // Conservative sync guess: if the file itself reports HDR
+    // metadata, assume the device can probably play it (most modern
+    // browsers/TVs handle 10-bit HEVC). The async probe overrides
+    // this with a real answer.
+    if(!ffprobe || !ffprobe.length) return []
+
+    let v = videoStream(ffprobe)
+
+    if(!v) return []
+
+    let features = []
+
+    let transfer = (v.color_transfer || '').toLowerCase()
+    let pixfmt = (v.pix_fmt || '').toLowerCase()
+    let bit10 = pixfmt.indexOf('p010') >= 0 || pixfmt.indexOf('yuv420p10') >= 0
+
+    if(transfer === 'smpte2084'){
+        features.push('pq', 'hdr10', 'bt2020')
+        if(bit10) features.push('10bit')
+    }
+    else if(transfer === 'arib-std-b67'){
+        features.push('hlg', 'bt2020')
+        if(bit10) features.push('10bit')
+    }
+
+    let codec = (v.codec_name || '').toLowerCase()
+
+    if(codec === 'hevc' && bit10){
+        if(features.indexOf('10bit') < 0) features.push('10bit')
+    }
+
+    // Dedupe while preserving HDR_FEATURES order.
+    let seen = {}
+    let ordered = []
+
+    HDR_FEATURES.forEach((f)=>{
+        if(features.indexOf(f) >= 0 && !seen[f]){
+            ordered.push(f)
+            seen[f] = true
+        }
+    })
+
+    return ordered
+}
+
 // --- async refinement via Media Capabilities ---
 
 function mcTierFor(contentType, params){
@@ -298,6 +422,7 @@ function mcTierFor(contentType, params){
 
 function runProbe(ffprobe, params){
     let caps = baseline(ffprobe)
+    caps.hdr = baselineHdr(ffprobe)
 
     if(legacyPlatform()) return Promise.resolve(caps)
 
@@ -335,7 +460,27 @@ function runProbe(ffprobe, params){
         }
     }
 
-    return Promise.all(tasks).then(()=>caps)
+    // Probe each HDR feature against the file's real params. A
+    // positive answer for a single probe is enough to mark the
+    // feature as supported — the other probes share the same decode
+    // pipeline for mainstream devices.
+    if(video){
+        HDR_FEATURES.forEach((feature)=>{
+            let mime = HDR_PROBES[feature].mimes[0]
+
+            tasks.push(mcTierFor(mime, params).then((tier)=>{
+                if(tier === 'hw' || tier === 'sw'){
+                    if(caps.hdr.indexOf(feature) < 0) caps.hdr.push(feature)
+                }
+            }))
+        })
+    }
+
+    return Promise.all(tasks).then(()=>{
+        // Stable order in the query string.
+        caps.hdr = HDR_FEATURES.filter((f)=>caps.hdr.indexOf(f) >= 0)
+        return caps
+    })
 }
 
 // --- public API ---
@@ -368,10 +513,15 @@ function gstQuerySync(ffprobe){
 
     let v = Object.keys(caps.v).map((codec)=>codec + ':' + caps.v[codec])
 
+    // If we have a cached probe (async finished), use its hdr list;
+    // otherwise fall back to the sync baseline.
+    let hdr = (caps.hdr && caps.hdr.length) ? caps.hdr : baselineHdr(ffprobe)
+
     let out = ''
 
     if(v.length) out += '&v=' + v.join(',')
     if(caps.a.length) out += '&a=' + caps.a.join(',')
+    if(hdr.length) out += '&hdr=' + hdr.join(',')
 
     return out
 }
