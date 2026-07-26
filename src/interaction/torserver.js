@@ -25,6 +25,113 @@ function ip(){
     return Storage.field('torrserver_use_link') == 'two' ? two || one : one || two
 }
 
+// TorrentError: structured failure passed to UI instead of a bare
+// string. The shape lets error() show a category title, human text,
+// and the raw context (URL + HTTP status) so the user knows what to
+// check or what to paste when filing a bug report.
+const ErrorKind = {
+    Network:      'network',      // no connection, DNS, CORS, abort, generic
+    Timeout:      'timeout',
+    Auth:         'auth',         // 401/403
+    NotFound:     'not_found',    // 404 / bad hash
+    Server:       'server',       // 5xx (incl. gst-not-yet-ready 502/503)
+    Metadata:     'metadata',     // 503 Retry-After — torrent BT not bootstrapped
+    GstOff:       'gst_off',      // /gst/echo failed → GST disabled on server
+    Parse:        'parse',        // JSON parse error
+    Unknown:      'unknown',
+}
+
+// classifyError maps (jqXHR, exception, url) → TorrentError.
+// Network exception strings come from $.ajax / xhr's `exception`
+// arg ("timeout", "abort", "parsererror", "error", or custom).
+function classifyError(jqXHR, exception, url){
+    const e = {
+        kind: ErrorKind.Unknown,
+        httpCode: 0,
+        message: '',
+        url: url || '',
+        retryable: false,
+        raw: '',
+    }
+
+    if(jqXHR && typeof jqXHR === 'object'){
+        e.httpCode = jqXHR.status || 0
+        e.raw = (jqXHR.responseText || jqXHR.message || '').toString().slice(0, 500)
+        const retryAfter = jqXHR.getResponseHeader && jqXHR.getResponseHeader('Retry-After')
+        if(retryAfter){
+            e.retryable = true
+            e.retryAfter = parseInt(retryAfter, 10) || 0
+        }
+    }
+
+    if(exception === 'timeout'){
+        e.kind = ErrorKind.Timeout
+        e.message = 'timeout'
+        e.retryable = true
+    } else if(exception === 'abort'){
+        e.kind = ErrorKind.Network
+        e.message = 'aborted'
+    } else if(exception === 'parsererror'){
+        e.kind = ErrorKind.Parse
+        e.message = 'invalid response'
+    } else if(e.httpCode === 0){
+        // No HTTP response at all → DNS / CORS / offline / wrong port
+        e.kind = ErrorKind.Network
+        e.message = 'no response (DNS/CORS/offline?)'
+    } else if(e.httpCode === 401 || e.httpCode === 403){
+        e.kind = ErrorKind.Auth
+        e.message = 'unauthorized'
+    } else if(e.httpCode === 404){
+        e.kind = ErrorKind.NotFound
+        e.message = 'not found'
+    } else if(e.httpCode === 503){
+        // TorrServer uses 503 + Retry-After when BT metadata not ready
+        e.kind = ErrorKind.Metadata
+        e.message = 'torrent metadata pending'
+        e.retryable = true
+    } else if(e.httpCode >= 500){
+        e.kind = ErrorKind.Server
+        e.message = e.raw || 'server error'
+        e.retryable = true
+    } else if(e.httpCode >= 400){
+        e.kind = ErrorKind.Server
+        e.message = e.raw || ('http ' + e.httpCode)
+    } else if(e.raw){
+        e.kind = ErrorKind.Server
+        e.message = e.raw
+    } else {
+        e.message = 'unknown'
+    }
+
+    return e
+}
+
+// gstErrKind classifies /gst/echo specifically: failure means the
+// server's gstreamer pipeline is disabled, not a generic network
+// problem. Returned as ErrorKind.GstOff so the UI can suggest the
+// right toggle.
+function classifyGstEchoError(jqXHR, exception, url){
+    const e = classifyError(jqXHR, exception, url)
+    if(e.kind === ErrorKind.Network || e.kind === ErrorKind.NotFound){
+        e.kind = ErrorKind.GstOff
+        e.message = 'gstreamer disabled on server'
+    }
+    return e
+}
+
+// ffprobeErrKind: /ffp/ failing can mean either the endpoint is
+// unavailable (server has no gst) or the hash is bogus (400). We
+// can't tell from the response alone, but the caller already knows
+// gstWork() — pass it in.
+function classifyFfprobeError(jqXHR, exception, url, gstEnabled){
+    const e = classifyError(jqXHR, exception, url)
+    if(!gstEnabled){
+        e.kind = ErrorKind.GstOff
+        e.message = 'gstreamer disabled on server'
+    }
+    return e
+}
+
 function my(success, fail){
     let data = JSON.stringify({
         action: 'list'
@@ -113,9 +220,11 @@ function connected(success, fail){
 
     network.timeout(5000)
 
-    network.silent(url()+'/settings',(json)=>{
+    let endpoint = url()+'/settings'
+
+    network.silent(endpoint,(json)=>{
         if(typeof json.CacheSize == 'undefined'){
-            fail(Lang.translate('torrent_error_nomatrix'))
+            fail(classifyError({status: 200, responseText: 'no CacheSize field'}, 'custom', endpoint))
         }
         else{
             success(json)
@@ -123,15 +232,19 @@ function connected(success, fail){
 
         gstCheck()
     },(a,c)=>{
-        fail(network.errorDecode(a,c))
+        fail(classifyError(a, c, endpoint))
     },JSON.stringify({action: 'get'}))
 }
 
 function gstCheck(){
-    network.silent(url()+'/gst/echo',(json)=>{
+    let endpoint = url()+'/gst/echo'
+    network.silent(endpoint,()=>{
         gst_work = true
     },(a,c)=>{
         gst_work = false
+        if(typeof console !== 'undefined'){
+            console.warn('TorrServer', 'gst/echo failed:', classifyGstEchoError(a, c, endpoint))
+        }
     })
 }
 
@@ -158,12 +271,22 @@ function ffprobe(hash, id){
         }
 
         let http = new Request()
+        let endpoint = url() + '/ffp/' + encodeURIComponent(hash) + '/' + encodeURIComponent(id)
 
         http.timeout(15000)
 
-        http.silent(url() + '/ffp/' + encodeURIComponent(hash) + '/' + encodeURIComponent(id), (json)=>{
+        http.silent(endpoint, (json)=>{
             resolve(json && json.streams ? json : null)
-        }, ()=>{
+        }, (a, c)=>{
+            // 400 on a bogus hash is the *expected* outcome of the
+            // endpoint when it works — the server probed and found
+            // nothing. /ffp/ failures of every other shape are
+            // surfaced to the console; resolution still falls back
+            // to torrent-level metadata.
+            const err = classifyFfprobeError(a, c, endpoint, gstWork())
+            if(typeof console !== 'undefined'){
+                console.warn('TorrServer', 'ffprobe failed:', err)
+            }
             resolve(null)
         })
     })
@@ -266,7 +389,19 @@ function clear(){
     network.clear()
 }
 
-function error(){
+// escapeHtml keeps user-supplied error text (URLs, server responses)
+// safe when injected into the modal HTML. Anything we display that
+// came from the wire must go through here.
+function escapeHtml(s){
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+}
+
+function error(reason){
     let temp = Template.get('torrent_error',{ip: ip()})
     let list = temp.find('.torrent-checklist__list > li')
     let info = temp.find('.torrent-checklist__info > div')
@@ -274,6 +409,42 @@ function error(){
     let prog = temp.find('.torrent-checklist__progress-bar > div')
     let comp = temp.find('.torrent-checklist__progress-steps')
     let btn  = temp.find('.selector')
+
+    // Surface a typed TorrentError when the caller gave us one. The
+    // modal title reflects the category (so the user knows what to
+    // check) and a collapsible details block carries the URL + HTTP
+    // status + raw message for bug reports.
+    let titleKey = 'torrent_error_connect'
+    if(reason && reason.kind){
+        titleKey = 'torsserver_error_' + reason.kind
+    }
+
+    if(reason && (reason.url || reason.message || reason.httpCode)){
+        let detailsHtml = '<div class="torrent-checklist__details">'
+        detailsHtml += '<div class="torrent-checklist__details-title">' + Lang.translate('torsserver_error_details') + '</div>'
+        if(reason.url){
+            detailsHtml += '<div class="torrent-checklist__details-row"><span class="k">URL</span><span class="v">' + escapeHtml(reason.url) + '</span></div>'
+        }
+        if(reason.httpCode){
+            detailsHtml += '<div class="torrent-checklist__details-row"><span class="k">HTTP</span><span class="v">' + reason.httpCode + '</span></div>'
+        }
+        if(reason.message){
+            detailsHtml += '<div class="torrent-checklist__details-row"><span class="k">Message</span><span class="v">' + escapeHtml(reason.message) + '</span></div>'
+        }
+        detailsHtml += '</div>'
+        temp.find('.torrent-checklist__body').append(detailsHtml)
+
+        temp.find('.torrent-checklist__copy').remove().end()
+        let copy = $('<div class="torrent-checklist__copy selector">'+Lang.translate('torsserver_error_copy')+'</div>')
+        copy.on('hover:enter', ()=>{
+            const payload = JSON.stringify(reason, null, 2)
+            if(navigator.clipboard && navigator.clipboard.writeText){
+                navigator.clipboard.writeText(payload)
+                try { Noty.show(Lang.translate('torsserver_error_copied'), {time: 2000}) } catch(e){}
+            }
+        })
+        temp.find('.torrent-checklist__body').append(copy)
+    }
 
     let position = -2
 
@@ -313,7 +484,7 @@ function error(){
         makeStep()
     })
 
-    Modal.title(Lang.translate('torrent_error_connect'))
+    Modal.title(Lang.translate(titleKey))
     Modal.update(temp)
 
     Controller.add('modal',{

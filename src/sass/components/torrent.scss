@@ -689,6 +689,55 @@
             width: 100%
         }
     }
+
+    &__details{
+        margin-top: 1.5em;
+        padding: 1em;
+        background-color: rgba(0, 0, 0, 0.3);
+        border-radius: 0.3em;
+        font-size: 1.1em;
+        line-height: 1.5;
+        word-break: break-all;
+
+        &-title{
+            font-weight: 600;
+            margin-bottom: 0.5em;
+            color: #fff;
+        }
+    }
+
+    &__details-row{
+        display: flex;
+        gap: 0.6em;
+        align-items: baseline;
+
+        .k{
+            color: rgb(255, 255, 255, 0.5);
+            flex-shrink: 0;
+            min-width: 5em;
+        }
+
+        .v{
+            color: #fff;
+            font-family: monospace;
+        }
+    }
+
+    &__copy{
+        margin-top: 1em;
+        padding: 0.6em 1em;
+        background-color: rgba(255, 255, 255, 0.1);
+        border-radius: 0.3em;
+        text-align: center;
+        font-weight: 600;
+        cursor: pointer;
+
+        &:focus,
+        &.focus{
+            background-color: rgba(255, 255, 255, 0.2);
+            outline: 0.2em solid #fff;
+        }
+    }
 }
 
 .torrnet-folder-name{

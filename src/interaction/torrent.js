@@ -111,7 +111,13 @@ function connect(){
     Torserver.connected(()=>{
         hash()
     },(echo)=>{
-        Torserver.error()
+        // connected() now passes a typed TorrentError. Torserver.error()
+        // can show a tailored checklist; we also surface a Noty so the
+        // user knows the failure before the modal appears.
+        try {
+            Noty.show(Lang.translate('torsserver_error_' + (echo && echo.kind ? echo.kind : 'network')) + (echo && echo.message ? ': ' + echo.message : ''), {time: 6000})
+        } catch(e){}
+        Torserver.error(echo)
     })
 }
 

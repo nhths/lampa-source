@@ -1023,6 +1023,19 @@ export default {
 
     settings_interface_glass_opacity: 'Glass transparency',
     torrent_error_check_no_auth: 'The server responded to the request, but the authorization failed',
+
+    torsserver_error_network: 'Cannot reach TorrServer',
+    torsserver_error_timeout: 'TorrServer did not respond in time',
+    torsserver_error_auth: 'TorrServer rejected the request (auth required)',
+    torsserver_error_not_found: 'TorrServer returned 404',
+    torsserver_error_server: 'TorrServer returned an error',
+    torsserver_error_metadata: 'TorrServer is fetching torrent metadata — try again in a few seconds',
+    torsserver_error_gst_off: 'GStreamer pipeline is disabled on TorrServer',
+    torsserver_error_parse: 'TorrServer returned an invalid response',
+    torsserver_error_unknown: 'TorrServer is unavailable',
+    torsserver_error_details: 'Details',
+    torsserver_error_copy: 'Copy details',
+    torsserver_error_copied: 'Copied',
     settings_interface_card_cover: 'Show cover',
 
     title_upcoming_episodes: 'Upcoming episode releases',
