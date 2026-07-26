@@ -29,6 +29,8 @@ let html = `<div class="torrent-checklist">
         </div>
     </div>
 
+    <div class="torrent-checklist__body"></div>
+
     <div class="torrent-checklist__footer">
         <div class="simple-button selector">#{torrent_error_start}</div><div class="torrent-checklist__next-step"></div>
     </div>

@@ -5,6 +5,7 @@ import Template from './template'
 import Controller from '../core/controller'
 import Modal from './modal'
 import Lang from '../core/lang'
+import Noty from './noty'
 import EpisodeParser from '../utils/episodes_parser'
 import Arrays from '../utils/arrays'
 import DeviceCaps from '../core/device_caps'
@@ -401,6 +402,26 @@ function escapeHtml(s){
         .replace(/'/g, '&#39;')
 }
 
+// maskUrlCredentials replaces user:password@ with user:***@ so we
+// don't leak credentials into the on-screen modal or the clipboard
+// when the user hits "Copy details". The rest of the URL (host,
+// port, path, query) is preserved.
+function maskUrlCredentials(s){
+    if(!s) return s
+    try {
+        const u = new URL(s)
+        if(u.username){
+            const cred = u.username + (u.password ? ':' + u.password : '')
+            return s.replace(cred + '@', u.username + ':***@')
+        }
+    } catch(e){
+        // not a parseable URL — try a regex fallback for inputs that
+        // aren't full URLs (proxies, raw host:port strings).
+        return s.replace(/([a-zA-Z0-9._-]+):([^@\s]+)@/, '$1:***@')
+    }
+    return s
+}
+
 function error(reason){
     let temp = Template.get('torrent_error',{ip: ip()})
     let list = temp.find('.torrent-checklist__list > li')
@@ -420,10 +441,15 @@ function error(reason){
     }
 
     if(reason && (reason.url || reason.message || reason.httpCode)){
+        // Mask credentials before any rendering or copy so we don't
+        // leak them into the modal or the clipboard.
+        const safeUrl = maskUrlCredentials(reason.url)
+        const safeReason = Object.assign({}, reason, {url: safeUrl})
+
         let detailsHtml = '<div class="torrent-checklist__details">'
         detailsHtml += '<div class="torrent-checklist__details-title">' + Lang.translate('torsserver_error_details') + '</div>'
-        if(reason.url){
-            detailsHtml += '<div class="torrent-checklist__details-row"><span class="k">URL</span><span class="v">' + escapeHtml(reason.url) + '</span></div>'
+        if(safeUrl){
+            detailsHtml += '<div class="torrent-checklist__details-row"><span class="k">URL</span><span class="v">' + escapeHtml(safeUrl) + '</span></div>'
         }
         if(reason.httpCode){
             detailsHtml += '<div class="torrent-checklist__details-row"><span class="k">HTTP</span><span class="v">' + reason.httpCode + '</span></div>'
@@ -434,10 +460,11 @@ function error(reason){
         detailsHtml += '</div>'
         temp.find('.torrent-checklist__body').append(detailsHtml)
 
-        temp.find('.torrent-checklist__copy').remove().end()
-        let copy = $('<div class="torrent-checklist__copy selector">'+Lang.translate('torsserver_error_copy')+'</div>')
+        // Copy button is NOT a .selector: it has its own handler and
+        // must not advance the checklist wizard when activated.
+        let copy = $('<div class="torrent-checklist__copy">'+Lang.translate('torsserver_error_copy')+'</div>')
         copy.on('hover:enter', ()=>{
-            const payload = JSON.stringify(reason, null, 2)
+            const payload = JSON.stringify(safeReason, null, 2)
             if(navigator.clipboard && navigator.clipboard.writeText){
                 navigator.clipboard.writeText(payload)
                 try { Noty.show(Lang.translate('torsserver_error_copied'), {time: 2000}) } catch(e){}
