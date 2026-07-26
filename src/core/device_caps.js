@@ -1,10 +1,10 @@
 import Platform from './platform'
-import Storage from './storage/storage'
 
-// Debug log for caps probing. Toggle via window.__LAMPA_CAPS_DEBUG__ = true
-// in DevTools console before clicking Play, or set lampa_caps_debug=1
-// in Storage. Output goes to console (grouped) + a ring buffer
-// accessible via window.__LAMPA_CAPS_LOG__ for copy-to-clipboard.
+// Debug log for caps probing. Always on — users on iPad / WebOS /
+// Tizen have no DevTools console to inspect failures, so the ring
+// buffer is the only way to diagnose why a stream isn't playing.
+// Output goes to console (grouped) and to a ring buffer exposed via
+// window.__LAMPA_CAPS_LOG__() for the in-app log viewer.
 //
 // Format: {ts, kind, params, result} where kind is one of:
 //   "probe.start"   — runProbe() entered
@@ -17,18 +17,8 @@ import Storage from './storage/storage'
 // leak memory after long sessions.
 const LOG_RING_SIZE = 100
 let logRing = []
-let debugEnabled = false
-
-try{
-    debugEnabled = !!Storage.get('lampa_caps_debug')
-}catch(e){}
-
-if(typeof window !== 'undefined' && window.__LAMPA_CAPS_DEBUG__ === true){
-    debugEnabled = true
-}
 
 function pushLog(entry){
-    if(!debugEnabled) return
     entry.ts = new Date().toISOString()
     logRing.push(entry)
     if(logRing.length > LOG_RING_SIZE) logRing.shift()
@@ -43,7 +33,6 @@ function pushLog(entry){
 
 if(typeof window !== 'undefined'){
     window.__LAMPA_CAPS_LOG__ = ()=>logRing.slice()
-    window.__LAMPA_CAPS_DEBUG__ = false
 }
 
 /**

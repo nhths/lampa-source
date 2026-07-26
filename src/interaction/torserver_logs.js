@@ -2,13 +2,11 @@ import Template from './template'
 import Modal from './modal'
 import Controller from '../core/controller'
 import Lang from '../core/lang'
-import Storage from '../core/storage/storage'
 import Noty from './noty'
-import DeviceCaps from '../core/device_caps'
 
 // Read logs from both ring buffers exposed by device_caps.js and
 // torserver.js. Each module owns its own buffer; this file is the
-// viewer.
+// viewer. Logging is always on — see device_caps.js comment.
 function readCapsLog(){
     try{ return (typeof window !== 'undefined' && window.__LAMPA_CAPS_LOG__) ? window.__LAMPA_CAPS_LOG__() : [] }
     catch(e){ return [] }
@@ -26,34 +24,6 @@ function readTsLog(){
 function clearLogs(){
     try{ window.__LAMPA_CAPS_LOG__ = ()=>[] }catch(e){}
     try{ window.__LAMPA_TS_LOG__ = ()=>[] }catch(e){}
-}
-
-function enableLogs(){
-    try{ Storage.set('lampa_caps_debug', '1') }catch(e){}
-    try{ Storage.set('lampa_ts_debug', '1') }catch(e){}
-    if(typeof window !== 'undefined'){
-        window.__LAMPA_CAPS_DEBUG__ = true
-        window.__LAMPA_TS_DEBUG__ = true
-    }
-    // Kick off a no-op probe so the buffer has at least one entry
-    // when the user opens the modal.
-    try{ DeviceCaps.gstQuery({streams: []}) }catch(e){}
-}
-
-function disableLogs(){
-    try{ Storage.set('lampa_caps_debug', '') }catch(e){}
-    try{ Storage.set('lampa_ts_debug', '') }catch(e){}
-    if(typeof window !== 'undefined'){
-        window.__LAMPA_CAPS_DEBUG__ = false
-        window.__LAMPA_TS_DEBUG__ = false
-    }
-}
-
-function isEnabled(){
-    let a = false, b = false
-    try{ a = !!Storage.get('lampa_caps_debug') }catch(e){}
-    try{ b = !!Storage.get('lampa_ts_debug') }catch(e){}
-    return a || b
 }
 
 function escapeHtml(s){
@@ -146,10 +116,6 @@ function copyJson(){
 }
 
 function open(){
-    if(!isEnabled()){
-        enableLogs()
-    }
-
     // Template 'lampa_logs' is registered by services/torrserver.js
     // (it lives there so the registry stays close to the wiring).
     let temp = Template.get('lampa_logs', {})
@@ -188,20 +154,11 @@ function open(){
     Controller.toggle('modal')
 }
 
-// Bound by settings toggle handler when the user changes the value.
-function onEnabledChange(){
-    if(isEnabled()) enableLogs()
-    else disableLogs()
-}
-
 function show(){
     open()
 }
 
 export default {
     show,
-    enableLogs,
-    disableLogs,
-    isEnabled,
     refresh,
 }

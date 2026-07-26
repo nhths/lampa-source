@@ -73,12 +73,6 @@ let html = `<div>
             <div class="settings-param__name">#{settings_server_logs_show}</div>
             <div class="settings-param__descr">#{settings_server_logs_show_descr}</div>
         </div>
-
-        <div class="settings-param selector" data-type="toggle" data-name="torrserver_logs_enabled">
-            <div class="settings-param__name">#{settings_server_logs_enabled}</div>
-            <div class="settings-param__value"></div>
-            <div class="settings-param__descr">#{settings_server_logs_enabled_descr}</div>
-        </div>
     </div>
 </div>`
 

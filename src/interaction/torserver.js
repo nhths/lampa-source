@@ -26,18 +26,14 @@ function ip(){
     return Storage.field('torrserver_use_link') == 'two' ? two || one : one || two
 }
 
-// Debug log for TorrServer lifecycle. Toggle via
-// window.__LAMPA_TS_DEBUG__ = true in DevTools, or
-// lampa_ts_debug=1 in Storage. Output goes to console (grouped) and
-// a ring buffer accessible via window.__LAMPA_TS_LOG__.
+// Debug log for TorrServer lifecycle. Always on — see device_caps.js
+// comment for rationale (no DevTools on TVs). Output goes to
+// console (grouped) and to a ring buffer exposed via
+// window.__LAMPA_TS_LOG__().
 const TS_LOG_RING = 80
 let tsLog = []
-let tsDebug = false
-try{ tsDebug = !!Storage.get('lampa_ts_debug') }catch(e){}
-if(typeof window !== 'undefined' && window.__LAMPA_TS_DEBUG__) tsDebug = true
 
 function tsPush(kind, data){
-    if(!tsDebug) return
     let entry = {ts: new Date().toISOString(), kind}
     if(data) Object.assign(entry, data)
     tsLog.push(entry)
@@ -51,7 +47,6 @@ function tsPush(kind, data){
 
 if(typeof window !== 'undefined'){
     window.__LAMPA_TS_LOG__ = ()=>tsLog.slice()
-    window.__LAMPA_TS_DEBUG__ = false
 }
 
 // TorrentError: structured failure passed to UI instead of a bare
