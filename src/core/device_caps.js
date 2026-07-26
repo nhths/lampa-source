@@ -1,4 +1,50 @@
 import Platform from './platform'
+import Storage from './storage/storage'
+
+// Debug log for caps probing. Toggle via window.__LAMPA_CAPS_DEBUG__ = true
+// in DevTools console before clicking Play, or set lampa_caps_debug=1
+// in Storage. Output goes to console (grouped) + a ring buffer
+// accessible via window.__LAMPA_CAPS_LOG__ for copy-to-clipboard.
+//
+// Format: {ts, kind, params, result} where kind is one of:
+//   "probe.start"   — runProbe() entered
+//   "probe.tier"    — decodingInfo returned for one codec/feature
+//   "probe.skipped" — feature not probed (legacy platform / no MC)
+//   "caps.snapshot" — final caps for the request (gstQuerySync)
+//   "baseline"      — sync baseline decision
+//
+// The ring buffer is bounded (last 100 entries) so the UI doesn't
+// leak memory after long sessions.
+const LOG_RING_SIZE = 100
+let logRing = []
+let debugEnabled = false
+
+try{
+    debugEnabled = !!Storage.get('lampa_caps_debug')
+}catch(e){}
+
+if(typeof window !== 'undefined' && window.__LAMPA_CAPS_DEBUG__ === true){
+    debugEnabled = true
+}
+
+function pushLog(entry){
+    if(!debugEnabled) return
+    entry.ts = new Date().toISOString()
+    logRing.push(entry)
+    if(logRing.length > LOG_RING_SIZE) logRing.shift()
+    if(typeof console !== 'undefined' && console.groupCollapsed){
+        console.groupCollapsed('[LampaCaps] ' + entry.kind)
+        try{
+            console.log(entry)
+        }catch(e){}
+        console.groupEnd()
+    }
+}
+
+if(typeof window !== 'undefined'){
+    window.__LAMPA_CAPS_LOG__ = ()=>logRing.slice()
+    window.__LAMPA_CAPS_DEBUG__ = false
+}
 
 /**
  * Device capability probe for TorrServer gstreamer transcoding.
@@ -320,6 +366,7 @@ function baseline(ffprobe){
     if(legacyPlatform()){
         caps.v.h264 = 'sw'
         caps.a.push('aac')
+        pushLog({kind: 'baseline', legacy: true, caps})
         return caps
     }
 
@@ -347,6 +394,7 @@ function baseline(ffprobe){
         if(key && AUDIO_CODECS[key].mimes.some(test) && caps.a.indexOf(key) === -1) caps.a.push(key)
     })
 
+    pushLog({kind: 'baseline', legacy: false, caps})
     return caps
 }
 
@@ -424,9 +472,15 @@ function runProbe(ffprobe, params){
     let caps = baseline(ffprobe)
     caps.hdr = baselineHdr(ffprobe)
 
-    if(legacyPlatform()) return Promise.resolve(caps)
+    pushLog({kind: 'probe.start', params, baseline: caps})
+
+    if(legacyPlatform()){
+        pushLog({kind: 'probe.skipped', reason: 'legacy_platform'})
+        return Promise.resolve(caps)
+    }
 
     if(!navigator.mediaCapabilities || !navigator.mediaCapabilities.decodingInfo){
+        pushLog({kind: 'probe.skipped', reason: 'no_media_capabilities'})
         return Promise.resolve(caps)
     }
 
@@ -469,6 +523,7 @@ function runProbe(ffprobe, params){
             let mime = HDR_PROBES[feature].mimes[0]
 
             tasks.push(mcTierFor(mime, params).then((tier)=>{
+                pushLog({kind: 'probe.tier', feature, mime, tier})
                 if(tier === 'hw' || tier === 'sw'){
                     if(caps.hdr.indexOf(feature) < 0) caps.hdr.push(feature)
                 }
@@ -479,6 +534,7 @@ function runProbe(ffprobe, params){
     return Promise.all(tasks).then(()=>{
         // Stable order in the query string.
         caps.hdr = HDR_FEATURES.filter((f)=>caps.hdr.indexOf(f) >= 0)
+        pushLog({kind: 'probe.done', final: caps})
         return caps
     })
 }
@@ -523,6 +579,7 @@ function gstQuerySync(ffprobe){
     if(caps.a.length) out += '&a=' + caps.a.join(',')
     if(hdr.length) out += '&hdr=' + hdr.join(',')
 
+    pushLog({kind: 'caps.snapshot', query: out, v: caps.v, a: caps.a, hdr})
     return out
 }
 

@@ -26,6 +26,34 @@ function ip(){
     return Storage.field('torrserver_use_link') == 'two' ? two || one : one || two
 }
 
+// Debug log for TorrServer lifecycle. Toggle via
+// window.__LAMPA_TS_DEBUG__ = true in DevTools, or
+// lampa_ts_debug=1 in Storage. Output goes to console (grouped) and
+// a ring buffer accessible via window.__LAMPA_TS_LOG__.
+const TS_LOG_RING = 80
+let tsLog = []
+let tsDebug = false
+try{ tsDebug = !!Storage.get('lampa_ts_debug') }catch(e){}
+if(typeof window !== 'undefined' && window.__LAMPA_TS_DEBUG__) tsDebug = true
+
+function tsPush(kind, data){
+    if(!tsDebug) return
+    let entry = {ts: new Date().toISOString(), kind}
+    if(data) Object.assign(entry, data)
+    tsLog.push(entry)
+    if(tsLog.length > TS_LOG_RING) tsLog.shift()
+    if(typeof console !== 'undefined' && console.groupCollapsed){
+        console.groupCollapsed('[TorrServer] ' + kind)
+        try{ console.log(entry) }catch(e){}
+        console.groupEnd()
+    }
+}
+
+if(typeof window !== 'undefined'){
+    window.__LAMPA_TS_LOG__ = ()=>tsLog.slice()
+    window.__LAMPA_TS_DEBUG__ = false
+}
+
 // TorrentError: structured failure passed to UI instead of a bare
 // string. The shape lets error() show a category title, human text,
 // and the raw context (URL + HTTP status) so the user knows what to
@@ -223,8 +251,12 @@ function connected(success, fail){
 
     let endpoint = url()+'/settings'
 
+    tsPush('connect.start', {url: endpoint})
+
     network.silent(endpoint,(json)=>{
-        if(typeof json.CacheSize == 'undefined'){
+        let ok = typeof json.CacheSize != 'undefined'
+        tsPush('connect.success', {url: endpoint, hasCacheSize: ok})
+        if(!ok){
             fail(classifyError({status: 200, responseText: 'no CacheSize field'}, 'custom', endpoint))
         }
         else{
@@ -233,7 +265,9 @@ function connected(success, fail){
 
         gstCheck()
     },(a,c)=>{
-        fail(classifyError(a, c, endpoint))
+        let err = classifyError(a, c, endpoint)
+        tsPush('connect.fail', {url: endpoint, kind: err.kind, httpCode: err.httpCode})
+        fail(err)
     },JSON.stringify({action: 'get'}))
 }
 
@@ -241,10 +275,13 @@ function gstCheck(){
     let endpoint = url()+'/gst/echo'
     network.silent(endpoint,()=>{
         gst_work = true
+        tsPush('gst.echo.ok', {url: endpoint})
     },(a,c)=>{
         gst_work = false
+        let err = classifyGstEchoError(a, c, endpoint)
+        tsPush('gst.echo.fail', {url: endpoint, kind: err.kind, httpCode: err.httpCode})
         if(typeof console !== 'undefined'){
-            console.warn('TorrServer', 'gst/echo failed:', classifyGstEchoError(a, c, endpoint))
+            console.warn('TorrServer', 'gst/echo failed:', err)
         }
     })
 }
@@ -254,9 +291,15 @@ function gstWork(){
 }
 
 function stream(path, hash, id, ffprobe){
-    if(gstWork()) return url() + '/gst/' + encodeURIComponent(hash) + '/master.m3u8?index=' + id + '&audio=0' + DeviceCaps.gstQuerySync(ffprobe)
-
-    return url() + '/stream/'+ encodeURIComponent(path.split('\\').pop().split('/').pop()) +'?link=' + hash + '&index=' + id + '&' + (Storage.field('torrserver_preload') ? 'preload' : 'play')
+    let caps = DeviceCaps.gstQuerySync(ffprobe)
+    let url
+    if(gstWork()){
+        url = url() + '/gst/' + encodeURIComponent(hash) + '/master.m3u8?index=' + id + '&audio=0' + caps
+    } else {
+        url = url() + '/stream/'+ encodeURIComponent(path.split('\\').pop().split('/').pop()) +'?link=' + hash + '&index=' + id + '&' + (Storage.field('torrserver_preload') ? 'preload' : 'play')
+    }
+    tsPush('stream.build', {hash, id, gst: gstWork(), url, caps})
+    return url
 }
 
 // Per-file ffprobe via TorrServer's /ffp/{hash}/{id}. Resolves to the
@@ -267,6 +310,7 @@ function stream(path, hash, id, ffprobe){
 function ffprobe(hash, id){
     return new Promise((resolve)=>{
         if(!gstWork()){
+            tsPush('ffprobe.skip', {hash, id, reason: 'gst_off'})
             resolve(null)
             return
         }
@@ -274,17 +318,17 @@ function ffprobe(hash, id){
         let http = new Request()
         let endpoint = url() + '/ffp/' + encodeURIComponent(hash) + '/' + encodeURIComponent(id)
 
+        tsPush('ffprobe.start', {hash, id, endpoint})
+
         http.timeout(15000)
 
         http.silent(endpoint, (json)=>{
-            resolve(json && json.streams ? json : null)
+            let ok = !!(json && json.streams)
+            tsPush('ffprobe.done', {hash, id, ok, streams: ok && json.streams.length})
+            resolve(ok ? json : null)
         }, (a, c)=>{
-            // 400 on a bogus hash is the *expected* outcome of the
-            // endpoint when it works — the server probed and found
-            // nothing. /ffp/ failures of every other shape are
-            // surfaced to the console; resolution still falls back
-            // to torrent-level metadata.
             const err = classifyFfprobeError(a, c, endpoint, gstWork())
+            tsPush('ffprobe.fail', {hash, id, kind: err.kind, httpCode: err.httpCode, message: err.message})
             if(typeof console !== 'undefined'){
                 console.warn('TorrServer', 'ffprobe failed:', err)
             }
